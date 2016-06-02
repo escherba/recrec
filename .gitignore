@@ -1,0 +1,10 @@
+*.py[cod]
+*.o
+*.h
+*.so*
+*.cpp
+*.txt
+Makefile
+README
+
+libpmf.py
