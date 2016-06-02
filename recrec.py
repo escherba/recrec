@@ -370,11 +370,16 @@ def build_model(args, trainval):
 def plot_rocs(data, save_to=None):
 
     import matplotlib.pyplot as plt
+    import palettable
+
+    colors = palettable.colorbrewer.qualitative.Set2_8.mpl_colors
     fig, ax = plt.subplots(1)
+    i = 0
     for filename, (xs, ys) in data:
         auc_score = metrics.auc(xs, ys, reorder=False)
         label = "%s (%.3f)" % (filename, auc_score)
-        ax.plot(xs, ys, '-', color='blue', label=label)
+        ax.plot(xs, ys, '-', color=colors[i], label=label)
+        i += 1
 
     ax.plot([0.0, 1.0], [0.0, 1.0], '--', color='gray')
     ax.set_ylabel("Portion Relevant")
@@ -445,7 +450,7 @@ def train_model(args):
 
     losses, aucs, rocs = zip(*results)
     logger.info("average of %d folds: loss=%.3f, auc=%.3f", n_outer_folds, np.average(losses), np.average(aucs))
-    pickle_dump(rocs, os.path.join(args.output_dir, "roc-data-%s.pkl" % args.setting))
+    pickle_dump(rocs, os.path.join(args.output_dir, "roc-%s.pkl" % args.setting))
 
 
 def parse_args(args=None):
