@@ -354,7 +354,7 @@ def parse_args(args=None):
     parser.add_argument('--setting', type=str, choices=TRAINING_SETTINGS.keys(),
                         default='SKL-SVD', help='which setting to use')
     parser.add_argument('--loss', type=str, choices=['auc', 'rmse'],
-                        default='auc', help='loss function to use')
+                        default='rmse', help='loss function to use')
     parser.add_argument('--seed', type=int, default=42,
                         help='random state')
     parser.add_argument('--normalize_roc', type=int, default=1,
