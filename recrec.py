@@ -3,6 +3,8 @@ import argparse
 import os
 import numpy as np
 import logging
+import cPickle as pickle
+from scipy import interp
 from sklearn import metrics, decomposition
 from itertools import product
 from pymaptools.benchmark import PMTimer
@@ -11,7 +13,7 @@ from pymaptools.sparse import dd2coo
 from pymaptools.iter import isiterable
 from collections import defaultdict, namedtuple
 from functools import partial
-from sklearn.cross_validation import train_test_split, KFold
+from sklearn.cross_validation import KFold
 
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +50,16 @@ skl_svd_grid = {
     'algorithm': ['arpack', 'randomized'],
     'tol': [1e-8, 1e-9, 1e-10],
 }
+
+
+def pickle_load(filename):
+    with open(filename, "rb") as fh:
+        return pickle.load(fh)
+
+
+def pickle_dump(obj, filename):
+    with open(filename, "wb") as fh:
+        pickle.dump(obj, fh)
 
 
 def write_ids(lines, fn):
@@ -241,7 +253,7 @@ class Model(object):
         # value (zero)
         fpr = np.insert(xs, 0, 0.0)
         tpr = np.insert(ys, 0, 0.0)
-        return fpr, tpr
+        return np.array([fpr, tpr])
 
     def loss_auc(self, ratings):
         """Calculate AUC loss
@@ -347,24 +359,6 @@ TRAINING_SETTINGS = {
 }
 
 
-def parse_args(args=None):
-    parser = argparse.ArgumentParser(args)
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Data directory')
-    parser.add_argument('--setting', type=str, choices=TRAINING_SETTINGS.keys(),
-                        default='SKL-SVD', help='which setting to use')
-    parser.add_argument('--loss', type=str, choices=['auc', 'rmse'],
-                        default='rmse', help='loss function to use')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='random state')
-    parser.add_argument('--normalize_roc', type=int, default=1,
-                        help='set to 1 to normalize ROC, 0 otherwise')
-    parser.add_argument('--folds', type=int, default=5,
-                        help='number of folds in cross-validation')
-    namespace = parser.parse_args()
-    return namespace
-
-
 def build_model(args, trainval):
     model_class, model_grid = TRAINING_SETTINGS[args.setting]
     paramGrid = buildParamGrid(model_grid)
@@ -373,42 +367,121 @@ def build_model(args, trainval):
                       loss=args.loss)
 
 
-def plot_roc(xs, ys, save_to=None):
+def plot_rocs(data, save_to=None):
 
     import matplotlib.pyplot as plt
-
-    auc_score = metrics.auc(xs, ys, reorder=False)
     fig, ax = plt.subplots(1)
+    for filename, (xs, ys) in data:
+        auc_score = metrics.auc(xs, ys, reorder=False)
+        label = "%s (%.3f)" % (filename, auc_score)
+        ax.plot(xs, ys, '-', color='blue', label=label)
 
-    ax.plot(xs, ys, '-', color='blue')
     ax.plot([0.0, 1.0], [0.0, 1.0], '--', color='gray')
-    ax.set_ylabel("True Positive Rate")
-    ax.set_xlabel("False Positive Rate")
-    ax.set_title("ROC Curve (AUC=%.3f)" % auc_score)
+    ax.set_ylabel("Portion Relevant")
+    ax.set_xlabel("Portion Irrelevant")
+    ax.set_title("ROC")
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.0])
+    ax.legend(loc='lower right')
 
     if save_to is None:
         fig.show()
+        plt.waitforbuttonpress()
     else:
         fig.savefig(save_to)
     fig.clf()
 
 
-def run(args):
+def average_roc(rocs):
+    """Interpolate and average multiple ROC curves
+    """
+    # First aggregate all false positive rates
+    n_classes = len(rocs)
+
+    fprs, tprs = zip(*rocs)
+    all_fpr = np.unique(np.concatenate(fprs))
+
+    # Then interpolate all ROC curves at this points
+    mean_tpr = np.zeros_like(all_fpr)
+    for i in range(n_classes):
+        mean_tpr += interp(all_fpr, fprs[i], tprs[i])
+
+    # Finally average it and compute AUC
+    mean_tpr /= n_classes
+
+    return all_fpr, mean_tpr
+
+
+def plot_roc_from_file(args):
+
+    data = []
+    for filename in args.input:
+        rocs = pickle_load(filename)
+        data.append((filename, average_roc(rocs)))
+    plot_rocs(data, save_to=args.output_file)
+
+
+def train_model(args):
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
+
     alias = read_artist_alias(os.path.join(args.data_dir, "artist_alias.txt"))
     ratings_array = read_user_artist(os.path.join(args.data_dir, "user_artist_data.txt"), alias)
 
-    trainval, testing = train_test_split(ratings_array, test_size=0.2, random_state=args.seed)
+    n_outer_folds = 3
+    outer_folds = KFold(len(ratings_array), n_folds=n_outer_folds, shuffle=True, random_state=args.seed)
 
-    model = build_model(args, trainval)
+    results = []
+    for idx, (trainval_idx, testing_idx) in enumerate(outer_folds):
+        trainval = ratings_array[trainval_idx]
+        testing = ratings_array[testing_idx]
+        model = build_model(args, trainval)
+        # final evaluation on the testing set
+        loss = model.loss(testing)
+        roc = model.compute_roc(testing, normalize=args.normalize_roc)
+        auc = metrics.auc(roc[0], roc[1], reorder=False)
+        logger.info("outer fold %d: loss=%.3f, auc=%.3f", idx, loss, auc)
+        results.append((loss, auc, roc))
 
-    # final evaluation on the testing set
-    logger.info("testing loss: %.3f", model.loss(testing))
+    losses, aucs, rocs = zip(*results)
+    logger.info("average of %d folds: loss=%.3f, auc=%.3f", n_outer_folds, np.average(losses), np.average(aucs))
+    pickle_dump(rocs, os.path.join(args.output_dir, "roc-data-%s.pkl" % args.setting))
 
-    xs, ys = model.compute_roc(testing, normalize=args.normalize_roc)
-    plot_roc(xs, ys, save_to="fig-roc-norm-%s.png" % args.setting)
+
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(args)
+
+    subparsers = parser.add_subparsers()
+
+    train = subparsers.add_parser('train')
+
+    train.add_argument('--data_dir', type=str, required=True,
+                       help='Data directory')
+    train.add_argument('--output_dir', type=str, required=True,
+                       help='Output directory')
+    train.add_argument('--setting', type=str, choices=TRAINING_SETTINGS.keys(),
+                       default='SKL-SVD', help='which setting to use')
+    train.add_argument('--loss', type=str, choices=['auc', 'rmse'],
+                       default='rmse', help='loss function to use')
+    train.add_argument('--seed', type=int, default=42,
+                       help='random state')
+    train.add_argument('--normalize_roc', type=int, default=1,
+                       help='set to 1 to normalize ROC, 0 otherwise')
+    train.add_argument('--folds', type=int, default=5,
+                       help='number of folds in cross-validation')
+    train.set_defaults(func=train_model)
+
+    plot = subparsers.add_parser('plot')
+    plot.add_argument('--input', type=str, nargs='+', required=True,
+                      help='file(s) containing a series of ROC curve data')
+    plot.add_argument('--output_file', type=str, default=None,
+                      help="place to write chart to")
+    plot.set_defaults(func=plot_roc_from_file)
+
+    namespace = parser.parse_args()
+    return namespace
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    args = parse_args()
+    args.func(args)
