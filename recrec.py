@@ -151,12 +151,14 @@ def group_ratings(ratings, by='row'):
 
 class Model(object):
 
-    def __init__(self, params):
+    def __init__(self, params, normalize_roc=True, loss='rmse'):
         self.row_map = None
         self.col_map = None
         self.params = params
         self.model_ = None
         self.components_ = None
+        self.normalize_roc = normalize_roc
+        self._loss = loss
 
     def predict(self, ratings, order='inner'):
         """Make predictions given a list of ratings/tuples
@@ -186,7 +188,7 @@ class Model(object):
         col_map = {k: idx for idx, k in enumerate(col_names)}
         return row_map, col_map, result
 
-    def compute_roc(self, ratings, normalize=False):
+    def compute_roc(self, ratings, normalize=None):
         """Compute Receiver Operating Characteristic Curve
         """
         row_map, col_map, preds = self.predict(ratings, order='row')
@@ -241,6 +243,12 @@ class Model(object):
         tpr = np.insert(ys, 0, 0.0)
         return fpr, tpr
 
+    def loss_auc(self, ratings):
+        """Calculate AUC loss
+        """
+        xs, ys = self.compute_roc(ratings, normalize=self.normalize_roc)
+        return 1.0 - metrics.auc(xs, ys, reorder=False)
+
     def loss_rmse(self, ratings):
         """Calculate model loss on validation set
         """
@@ -257,11 +265,17 @@ class Model(object):
             n += 1
         return np.sqrt(total / n)
 
-    def loss(self, ratings, loss='rmse'):
+    def loss(self, ratings, loss=None):
         """Calculate model loss on validation set
         """
+        if loss is None:
+            loss = self._loss
         if loss == 'rmse':
             return self.loss_rmse(ratings)
+        elif loss == 'auc':
+            return self.loss_auc(ratings)
+        else:
+            raise ValueError(loss)
 
 
 class PMFModel(Model):
@@ -300,29 +314,32 @@ class SVDModel(Model):
         return self
 
 
-def gridSearch(model_class, trainval, params, n_folds=5, seed=42):
+def gridSearch(model_class, trainval, params, n_folds=5, seed=42,
+               normalize_roc=True, loss='rmse'):
     folds = KFold(len(trainval), n_folds=n_folds, shuffle=True, random_state=seed)
     results = []
     total = len(params)
     for idx, param in enumerate(params):
-        fold_losses = []
+        fold_scores = []
         training_times = []
         for training_idx, validation_idx in folds:
             with PMTimer() as timer:
-                model = model_class(param).fit(trainval[training_idx])
+                model = model_class(param, normalize_roc=normalize_roc)
+                model.fit(trainval[training_idx])
             training_times.append(timer.clock_interval)
-            fold_losses.append(model.loss(trainval[validation_idx]))
-        avg_loss = np.average(fold_losses)
+            score = model.loss(trainval[validation_idx], loss=loss)
+            fold_scores.append(score)
+        avg_score = np.average(fold_scores)
         avg_time = np.average(training_times)
-        logger.info("%d/%d: loss=%.3f, param=%s (%.3f sec)", idx, total, avg_loss, param, avg_time)
-        results.append((avg_loss, avg_time, param))
+        logger.info("%d/%d: loss=%.3f, param=%s (%.3f sec)", idx, total, avg_score, param, avg_time)
+        results.append((avg_score, avg_time, param))
     # refit the model on the best parameter set
-    best_loss, best_time, best_param = min(results)
-    logger.info("best: loss=%.3f, time=%.3f sec, param=%s", best_loss, best_time, best_param)
+    best_score, best_time, best_param = min(results)
+    logger.info("best: loss=%.3f, time=%.3f sec, param=%s", best_score, best_time, best_param)
     return model_class(best_param).fit(trainval)
 
 
-MODEL_CLASSES = {
+TRAINING_SETTINGS = {
     'PMF-NMF': (PMFModel, pmf_nmf_grid),
     'PMF-SVD': (PMFModel, pmf_svd_grid),
     'SKL-NMF': (NMFModel, skl_nmf_grid),
@@ -334,8 +351,10 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser(args)
     parser.add_argument('--data_dir', type=str, required=True,
                         help='Data directory')
-    parser.add_argument('--setting', type=str, choices=MODEL_CLASSES.keys(),
+    parser.add_argument('--setting', type=str, choices=TRAINING_SETTINGS.keys(),
                         default='SKL-SVD', help='which setting to use')
+    parser.add_argument('--loss', type=str, choices=['auc', 'rmse'],
+                        default='auc', help='loss function to use')
     parser.add_argument('--seed', type=int, default=42,
                         help='random state')
     parser.add_argument('--normalize_roc', type=int, default=1,
@@ -347,9 +366,11 @@ def parse_args(args=None):
 
 
 def build_model(args, trainval):
-    model_class, model_grid = MODEL_CLASSES[args.setting]
+    model_class, model_grid = TRAINING_SETTINGS[args.setting]
     paramGrid = buildParamGrid(model_grid)
-    return gridSearch(model_class, trainval, paramGrid, n_folds=args.folds, seed=args.seed)
+    return gridSearch(model_class, trainval, paramGrid, n_folds=args.folds,
+                      seed=args.seed, normalize_roc=args.normalize_roc,
+                      loss=args.loss)
 
 
 def plot_roc(xs, ys, save_to=None):
