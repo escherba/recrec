@@ -6,7 +6,7 @@ import logging
 import cPickle as pickle
 from scipy import interp
 from sklearn import metrics, decomposition
-from itertools import product
+from itertools import product, izip
 from pymaptools.benchmark import PMTimer
 from pymaptools.unionfind import UnionFind
 from pymaptools.sparse import dd2coo
@@ -133,7 +133,7 @@ def ratings2coo(ratings):
 
 
 def buildParamGrid(gridSpec):
-    ks, vs = zip(*gridSpec.items())
+    ks, vs = zip(*gridSpec.items()) if gridSpec else ((), ())
     all_params = []
 
     # ensure all vs are iterable
@@ -145,7 +145,7 @@ def buildParamGrid(gridSpec):
 
     for vv in product(*all_vals):
         these_params = []
-        for k, v in zip(ks, vv):
+        for k, v in izip(ks, vv):
             these_params.append((k, v))
         all_params.append(these_params)
     return all_params
@@ -161,49 +161,67 @@ def group_ratings(ratings, by='row'):
     return dd
 
 
+def group_single(ratings, by='row'):
+    idx = 0 if by == 'row' else 1
+    dd = defaultdict(float)
+    for rating in ratings:
+        dd[rating[idx]] += rating[2]
+    return dd
+
+
 class Model(object):
 
     def __init__(self, params, normalize_roc=True, loss='rmse'):
-        self.row_map = None
-        self.col_map = None
+        self.row_map_ = None
+        self.col_map_ = None
         self.params = params
-        self.model_ = None
-        self.components_ = None
         self.normalize_roc = normalize_roc
         self._loss = loss
 
+        # fitted parameters
+        self.model_ = None
+        self.components_ = None
+        self.margins_ = None
+
     def predict(self, ratings, order='inner'):
         """Make predictions given a list of ratings/tuples
-
         If order='inner' (default), will only return rows *and* columns present
         in the testing input. If order='row', will limit rows to those present
         in the input, and return all columns. If order='column', vice versa.
         """
-        row_vecs, col_vecs = self.components_
-        row_map, col_map = self.row_map, self.col_map
+        row_map, col_map = self.row_map_, self.col_map_
 
+        # limit to what we have
         red_rows = row_map.keys() \
             if order == 'column' \
             else [r for r in set(ratings[:, 0]) if r in row_map]
         red_cols = col_map.keys() \
             if order == 'row' \
             else [c for c in set(ratings[:, 1]) if c in col_map]
+
         row_results = sorted([(row_map[r], r) for r in red_rows])
         col_results = sorted([(col_map[c], c) for c in red_cols])
         row_idx, row_names = map(list, zip(*row_results) if row_results else ((), ()))
         col_idx, col_names = map(list, zip(*col_results) if col_results else ((), ()))
-
-        act_row_vecs = row_vecs[row_idx]
-        act_col_vecs = col_vecs[col_idx]
-        result = np.matmul(act_row_vecs, act_col_vecs.T)
         row_map = {k: idx for idx, k in enumerate(row_names)}
         col_map = {k: idx for idx, k in enumerate(col_names)}
+
+        if self.margins_ is None:
+            row_vecs, col_vecs = self.components_
+            act_row_vecs = row_vecs[row_idx]
+            act_col_vecs = col_vecs[col_idx]
+            result = np.matmul(act_row_vecs, act_col_vecs.T)
+        else:
+            row_marg = self.margins_[0]
+            result = np.array([row_marg[col_idx] for _ in row_idx])
+
         return row_map, col_map, result
 
     def compute_roc(self, ratings, normalize=None):
         """Compute Receiver Operating Characteristic Curve
         """
         row_map, col_map, preds = self.predict(ratings, order='row')
+
         inv_col_map = {v: k for k, v in col_map.iteritems()}
 
         ordered_ratings = []
@@ -264,7 +282,7 @@ class Model(object):
     def loss_rmse(self, ratings):
         """Calculate model loss on validation set
         """
-        user_map, prod_map, preds = self.predict(ratings)
+        user_map, prod_map, preds = self.predict(ratings, order='inner')
         total = 0.0
         n = 0
         for u, p, r in ratings:
@@ -290,10 +308,20 @@ class Model(object):
             raise ValueError(loss)
 
 
+class PopularModel(Model):
+
+    def fit(self, data):
+        self.row_map_, self.col_map_, coo_mat = ratings2coo(data)
+        self.margins_ = \
+            np.asarray(coo_mat.sum(axis=0)).ravel(), \
+            np.asarray(coo_mat.sum(axis=1)).ravel()
+        return self
+
+
 class PMFModel(Model):
 
     def fit(self, data):
-        self.row_map, self.col_map, coo_mat = ratings2coo(data)
+        self.row_map_, self.col_map_, coo_mat = ratings2coo(data)
         param_string = ' '.join(["-%s %s" % pair for pair in self.params])
         self.model_ = model = libpmf.train(coo_mat, param_string)
         self.components_ = model['W'], model['H']
@@ -303,10 +331,9 @@ class PMFModel(Model):
 class NMFModel(Model):
 
     def fit(self, data):
+        self.row_map_, self.col_map_, coo_mat = ratings2coo(data)
         param_dict = dict(self.params)
         nmf = decomposition.NMF(**param_dict)
-        row_map, col_map, coo_mat = ratings2coo(data)
-        self.row_map, self.col_map = row_map, col_map
         self.model_ = nmf.fit(coo_mat)
         comp2 = nmf.components_.T
         self.components_ = coo_mat.dot(comp2), comp2
@@ -316,10 +343,9 @@ class NMFModel(Model):
 class SVDModel(Model):
 
     def fit(self, data):
+        self.row_map_, self.col_map_, coo_mat = ratings2coo(data)
         param_dict = dict(self.params)
         nmf = decomposition.TruncatedSVD(**param_dict)
-        row_map, col_map, coo_mat = ratings2coo(data)
-        self.row_map, self.col_map = row_map, col_map
         self.model_ = nmf.fit(coo_mat)
         comp2 = nmf.components_.T
         self.components_ = coo_mat.dot(comp2), comp2
@@ -348,7 +374,7 @@ def gridSearch(model_class, trainval, params, n_folds=5, seed=42,
     # refit the model on the best parameter set
     best_score, best_time, best_param = min(results)
     logger.info("best: loss=%.3f, time=%.3f sec, param=%s", best_score, best_time, best_param)
-    return model_class(best_param).fit(trainval)
+    return best_param
 
 
 TRAINING_SETTINGS = {
@@ -356,15 +382,23 @@ TRAINING_SETTINGS = {
     'pmf-SVD': (PMFModel, pmf_svd_grid),
     'skl-NMF': (NMFModel, skl_nmf_grid),
     'skl-SVD': (SVDModel, skl_svd_grid),
+    'popular': (PopularModel, {})
 }
 
 
 def build_model(args, trainval):
     model_class, model_grid = TRAINING_SETTINGS[args.setting]
-    paramGrid = buildParamGrid(model_grid)
-    return gridSearch(model_class, trainval, paramGrid, n_folds=args.folds,
-                      seed=args.seed, normalize_roc=args.normalize_roc,
-                      loss=args.loss)
+    if model_class == PopularModel:
+        # fit directly: PopularModel does not use any hyperparameters
+        model = model_class(None, normalize_roc=args.normalize_roc)
+        return model.fit(trainval)
+    else:
+        # find best hyperparameters and then fit the model using them
+        paramGrid = buildParamGrid(model_grid)
+        best_param = gridSearch(
+            model_class, trainval, paramGrid, n_folds=args.folds,
+            seed=args.seed, normalize_roc=args.normalize_roc, loss=args.loss)
+        return model_class(best_param).fit(trainval)
 
 
 def plot_rocs(data, save_to=None):
@@ -463,17 +497,16 @@ def train_model(args):
         results.append((loss, auc, roc))
 
     losses, aucs, rocs = zip(*results)
-    logger.info("average of %d folds: loss=%.3f, auc=%.3f", n_outer_folds, np.average(losses), np.average(aucs))
+    logger.info("average of %d folds: loss=%.3f, auc=%.3f",
+                n_outer_folds, np.average(losses), np.average(aucs))
     pickle_dump(rocs, os.path.join(args.output_dir, "%s.pkl" % args.setting))
 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(args)
-
     subparsers = parser.add_subparsers()
 
     train = subparsers.add_parser('train')
-
     train.add_argument('--data_dir', type=str, required=True,
                        help='Data directory')
     train.add_argument('--output_dir', type=str, required=True,
