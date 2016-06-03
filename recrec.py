@@ -313,8 +313,8 @@ class PopularModel(Model):
     def fit(self, data):
         self.row_map_, self.col_map_, coo_mat = ratings2coo(data)
         self.margins_ = \
-            np.asarray(coo_mat.sum(axis=0)).ravel(), \
-            np.asarray(coo_mat.sum(axis=1)).ravel()
+            np.asarray(coo_mat.sum(axis=0) / float(coo_mat.shape[0])).ravel(), \
+            np.asarray(coo_mat.sum(axis=1) / float(coo_mat.shape[1])).ravel()
         return self
 
 
