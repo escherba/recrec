@@ -22,21 +22,21 @@ logger = logging.getLogger(__name__)
 
 Rating = namedtuple('Rating', 'user product rating'.split())
 
-pmf_svd_grid = {
-    'N': [0],
-    'k': [2, 4, 8],
-    'l': [0.1, 1.0, 10.0, 100.0]
+pmf_grid = {
+    'n': 16,   # number of threads
+    'k': [2, 4, 8],  # rank
+    'l': [0.1, 1.0, 10.0, 100.0],
+    't': [5, 10],    # number of iterations
+    'T': [5, 10],    # number of iterations
+    'e': [1e-3, 1e-6]    # epsilon
 }
 
-pmf_nmf_grid = {
-    'N': [1],
-    'k': [2, 4, 8],
-    'l': [0.1, 1.0, 10.0, 100.0]
-}
+pmf_svd_grid = dict(pmf_grid.items() + {'N': 0}.items())
+pmf_nmf_grid = dict(pmf_grid.items() + {'N': 1}.items())
 
 skl_nmf_grid = {
-    'n_components': [8, 16],
-    'max_iter': [50, 100],
+    'n_components': [6, 9, 12],
+    'max_iter': [50, 75],
     'alpha': [3000.0, 10000.0, 30000.0],
     'solver': 'cd',
     'l1_ratio': [0.0, 0.1, 1.0],
@@ -45,10 +45,10 @@ skl_nmf_grid = {
 }
 
 skl_svd_grid = {
-    'n_components': [4, 8],
+    'n_components': [6, 9, 12],
     'n_iter': [5, 10, 20],
     'algorithm': ['arpack', 'randomized'],
-    'tol': [1e-8, 1e-9, 1e-10],
+    'tol': [1e-5, 1e-6],
 }
 
 
@@ -352,10 +352,10 @@ def gridSearch(model_class, trainval, params, n_folds=5, seed=42,
 
 
 TRAINING_SETTINGS = {
-    'PMF-NMF': (PMFModel, pmf_nmf_grid),
-    'PMF-SVD': (PMFModel, pmf_svd_grid),
-    'SKL-NMF': (NMFModel, skl_nmf_grid),
-    'SKL-SVD': (SVDModel, skl_svd_grid),
+    'pmf-NMF': (PMFModel, pmf_nmf_grid),
+    'pmf-SVD': (PMFModel, pmf_svd_grid),
+    'skl-NMF': (NMFModel, skl_nmf_grid),
+    'skl-SVD': (SVDModel, skl_svd_grid),
 }
 
 
@@ -378,7 +378,7 @@ def plot_rocs(data, save_to=None):
     for filename, (xs, ys) in data:
         auc_score = metrics.auc(xs, ys, reorder=False)
         label = "%s (%.3f)" % (filename, auc_score)
-        ax.plot(xs, ys, '-', color=colors[i], label=label)
+        ax.plot(xs, ys, '-', linewidth=1.2, color=colors[i], label=label)
         i += 1
 
     ax.plot([0.0, 1.0], [0.0, 1.0], '--', color='gray')
@@ -426,12 +426,26 @@ def plot_roc_from_file(args):
     plot_rocs(data, save_to=args.output_file)
 
 
+def load_audioscrobbler(args):
+    alias = read_artist_alias(os.path.join(args.data_dir, "artist_alias.txt"))
+    return read_user_artist(os.path.join(args.data_dir, "user_artist_data.txt"), alias)
+
+
+def load_freewheel(args):
+    data = []
+    with open("/Users/eugenescherba/dev/analysis/freewheel/sampleView.csv", "r") as fh:
+        for line in fh:
+            row = line.strip().split(',')
+            data.append(Rating(int(row[0]), int(row[1]), float(row[2])))
+    return np.array(data)
+
+
 def train_model(args):
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
 
-    alias = read_artist_alias(os.path.join(args.data_dir, "artist_alias.txt"))
-    ratings_array = read_user_artist(os.path.join(args.data_dir, "user_artist_data.txt"), alias)
+    # ratings_array = load_freewheel(args)
+    ratings_array = load_audioscrobbler(args)
 
     n_outer_folds = 3
     outer_folds = KFold(len(ratings_array), n_folds=n_outer_folds, shuffle=True, random_state=args.seed)
@@ -450,7 +464,7 @@ def train_model(args):
 
     losses, aucs, rocs = zip(*results)
     logger.info("average of %d folds: loss=%.3f, auc=%.3f", n_outer_folds, np.average(losses), np.average(aucs))
-    pickle_dump(rocs, os.path.join(args.output_dir, "roc-%s.pkl" % args.setting))
+    pickle_dump(rocs, os.path.join(args.output_dir, "%s.pkl" % args.setting))
 
 
 def parse_args(args=None):
